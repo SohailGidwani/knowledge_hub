@@ -22,6 +22,7 @@ from werkzeug.utils import secure_filename
 from . import api_bp
 from ..db import db
 from ..models import Document, User
+from ..ingestion import process_document
 
 # ---- helpers ----
 def get_default_user():
@@ -164,6 +165,8 @@ def upload_document():
     )
     db.session.add(doc)
     db.session.commit()
+    # --- Ingest now (sync) ---
+    ingest_result = process_document(doc.id, lang="eng")
 
     return jsonify({
         "id": doc.id,
@@ -174,4 +177,5 @@ def upload_document():
         # Present a friendlier path by stripping container‑specific prefix.
         "source_path": doc.source_path.replace("/app/", "/"),
         "status": doc.status,
+        "ingest_result": ingest_result,
     }), 201
