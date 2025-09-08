@@ -1,0 +1,18 @@
+# Bytecode / cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtualenv / build artifacts
+.eggs/
+*.egg-info/
+
+# Local environment and tooling
+.env
+.idea/
+.vscode/
+
+# Project data mounts
+.data/
+/data/
+/storage/

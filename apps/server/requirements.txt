@@ -1,0 +1,16 @@
+# Web framework
+Flask==3.0.3
+
+# ORM and Postgres driver
+flask_sqlalchemy==3.1.1
+psycopg2-binary==2.9.9
+
+# Config management
+pydantic-settings==2.4.0
+
+# Vector extension + server
+pgvector==0.2.5
+gunicorn==22.0.0
+
+# File type detection for uploads
+filetype==1.2.0
