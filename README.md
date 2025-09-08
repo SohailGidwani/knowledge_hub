@@ -85,13 +85,13 @@ flowchart LR
   end
 
   subgraph API[Flask API]
-    R[Routes /api/*]
-    M[Models + SQLAlchemy]
-    I[Ingestion (OCR)]
+    R[Routes /api]
+    M[Models and SQLAlchemy]
+    I[Ingestion OCR]
   end
 
-  DB[(Postgres + pgvector)]
-  FS[(Storage dir)]
+  DB[Postgres with pgvector]
+  FS[Storage directory]
 
   A --> R
   R --> M
