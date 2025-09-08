@@ -1,141 +1,199 @@
-# Knowledge Hub API
+<div align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=12,15,19,22,27&height=180&section=header&text=Knowledge%20Hub&fontSize=56&fontAlignY=35&animation=fadeIn&fontColor=ffffff" alt="header" />
+</div>
 
-A minimal document management and ingestion service built with Flask, SQLAlchemy, and Postgres + pgvector. It exposes a small HTTP API to upload and list documents, with optional OCR-based ingestion to turn PDFs/images into text chunks.
+<h3 align="center">
+  <em>A minimal, container-ready document API with optional OCR ingestion</em>
+</h3>
 
-## Features
-- Health checks and simple JSON API
-- Upload documents and store metadata (MIME, size, SHA-256)
-- List recent documents
-- Postgres schema with Users, Documents, Chunks, Embeddings, and Tags
-- Optional OCR ingestion (PDFs/images → text chunks) using Tesseract, OpenCV, and PyMuPDF
-- Docker and Docker Compose for local development
+<div align="center">
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white" />
+  <img src="https://img.shields.io/badge/Flask-3.0-000?logo=flask&logoColor=white" />
+  <img src="https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white" />
+  <img src="https://img.shields.io/badge/pgvector-enabled-2E7D32" />
+  <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" />
+  <img src="https://img.shields.io/badge/Status-Experimental-FF6A00" />
+</div>
 
-## Quick Start (Docker Compose)
-Prerequisites: Docker and Docker Compose
+<br />
+
+## ✨ What Is This?
+Knowledge Hub is a lightweight document management and ingestion service built with Flask, SQLAlchemy, and Postgres+pgvector. It exposes simple endpoints to upload, list, and manage documents — with an optional OCR pipeline to turn PDFs/images into searchable text chunks.
+
+<div align="center">
+  <sub>Quick links</sub><br />
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-api">API</a> •
+  <a href="#-tech-stack">Tech Stack</a> •
+  <a href="#-ingestion-ocr-optional">OCR</a> •
+  <a href="#-development">Dev</a>
+</div>
+
+---
+
+## 🚀 Quick Start
+Prereqs: Docker + Docker Compose
 
 ```bash
 # Build and launch database + API
 docker compose up --build
 
-# API available at
-http://localhost:8000
+# API base URL
+open http://localhost:8000
 
-# Health check
+# Health checks
 curl http://localhost:8000/health
 curl http://localhost:8000/api/ping
 ```
 
-By default, the database stores data in `./data/postgres`, and uploaded files are bind mounted into `./storage`. Adjust paths in `compose.yaml` as needed.
+Data lives under `./data/postgres`, and uploads under `./storage`. Tweak `compose.yaml` to your needs.
 
-## Configuration
-Configuration values are loaded via Pydantic from environment variables and `.env`.
+---
 
-Important variables (see `.env`):
-- `DATABASE_URL`: SQLAlchemy DSN used by the API (Compose points to the `db` service)
-- `SECRET_KEY`: Flask secret for signing
+## 🔌 API
+Base: `http://localhost:8000/api`
 
-The Flask app also sets:
-- `STORAGE_DIR`: Where uploads are stored (defaults to `/app/storage` inside the container)
-- `MAX_CONTENT_LENGTH`: Upload size cap (1 GiB by default)
+- `GET /ping` — simple OK check
+- `GET /documents` — list latest 50 documents
+- `POST /documents` — create by title (JSON)
+- `POST /documents/upload` — multipart file upload (with optional `title`)
 
-## API Endpoints
-Base URL when using Compose: `http://localhost:8000/api`
-
-- `GET /ping`: Health check
-- `GET /documents`: List up to 50 most recent documents
-- `POST /documents`: Create a document by title (JSON)
-- `POST /documents/upload`: Multipart upload of a file
-
-Examples:
+Examples
 
 ```bash
-# Ping
-curl http://localhost:8000/api/ping
-
 # List documents
 curl http://localhost:8000/api/documents
 
-# Create a document by title
+# Create by title
 curl -X POST http://localhost:8000/api/documents \
   -H 'Content-Type: application/json' \
   -d '{"title": "My Note"}'
 
-# Upload a file with optional custom title
+# Upload a PDF
 curl -X POST http://localhost:8000/api/documents/upload \
   -F "file=@/path/to/file.pdf" \
   -F "title=Project Plan"
 ```
 
-## Project Structure
+---
+
+## 🧱 Architecture
+```mermaid
+flowchart LR
+  subgraph Client
+    A[HTTP requests]
+  end
+
+  subgraph API[Flask API]
+    R[Routes /api/*]
+    M[Models + SQLAlchemy]
+    I[Ingestion (OCR)]
+  end
+
+  DB[(Postgres + pgvector)]
+  FS[(Storage dir)]
+
+  A --> R
+  R --> M
+  M <-.-> DB
+  R --> FS
+  R --> I
+  I --> M
+```
+
+---
+
+## 🧰 Tech Stack
+<div align="center">
+  <img src="https://skillicons.dev/icons?i=python,flask,postgres,docker" height="48" />
+  <br />
+  <sub>Plus: SQLAlchemy, Gunicorn, pgvector, Pydantic Settings</sub>
+  <br />
+  <sub>OCR (optional): OpenCV, PyMuPDF, Tesseract, NumPy</sub>
+  <br /><br />
+</div>
+
+Project layout
+
 ```
 apps/server/
   app/
-    __init__.py          # Flask app factory
-    config.py            # Pydantic-based settings
-    db.py                # SQLAlchemy instance
-    models.py            # ORM models (User, Document, Chunk, ...)
-    ingestion.py         # Optional OCR ingestion utilities
+    __init__.py     # Flask app factory
+    config.py       # Pydantic-based settings
+    db.py           # SQLAlchemy instance
+    models.py       # ORM models
+    ingestion.py    # OCR ingestion utilities (optional)
     api/
-      __init__.py        # API blueprint
-      routes.py          # API endpoints
-  Dockerfile             # Container image for the API
+      __init__.py   # API blueprint
+      routes.py     # Endpoints
+  Dockerfile        # API container image
 
-compose.yaml             # Compose stack (db + api)
-.env                     # Local environment config
-README.md                # This file
+compose.yaml        # Compose stack (db + api)
+.env                # Local environment config
 ```
 
-## Database
-- Uses Postgres with the `pgvector` extension. On startup, the app ensures the `vector` extension exists.
-- Tables are created automatically on app boot via `db.create_all()`.
+---
 
-## Ingestion (Optional)
-The `apps/server/app/ingestion.py` module provides simple OCR-based ingestion:
-- PDFs: render pages (PyMuPDF), preprocess (OpenCV), OCR (Tesseract), store chunks
-- Images: preprocess and OCR into a single-page document
+## 🧪 Configuration
+Values are pulled from env and `.env` via Pydantic (see `apps/server/app/config.py`).
 
-Dependencies (not included in the default Dockerfile/requirements):
-- Python: `opencv-python`, `pytesseract`, `PyMuPDF` (fitz), `numpy`
-- System: `tesseract-ocr` binary available on PATH
+- `DATABASE_URL` — SQLAlchemy DSN used by the API
+- `SECRET_KEY` — Flask secret for signing
+- `STORAGE_DIR` — upload directory (default `/app/storage`)
+- `MAX_CONTENT_LENGTH` — upload size cap (1 GiB default)
 
-If you want ingestion in Docker, extend the image to install system packages and Python deps, e.g.:
+---
+
+## 🔎 Ingestion (OCR) — Optional
+`apps/server/app/ingestion.py` can OCR PDFs/images into text chunks and store them as `Chunk` rows.
+
+You’ll need extra deps to enable OCR:
+
+Python packages
+
+```text
+opencv-python
+pytesseract
+PyMuPDF
+numpy
+```
+
+System packages (inside Docker)
 
 ```dockerfile
-# Dockerfile snippet (example)
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     libgl1 \
  && rm -rf /var/lib/apt/lists/*
-
-# requirements.txt additions
-# opencv-python
-# pytesseract
-# PyMuPDF
-# numpy
 ```
 
-Note: OCR and image handling can significantly increase image size and build time. Keep it separate if you don’t need it in production.
+Note: OCR increases image size; keep it separate if you don’t need it in prod.
 
-## Development (Local, without Docker)
-Prerequisites: Python 3.11, Postgres 16 with `pgvector` extension.
+---
+
+## 🛠 Development
+Local (without Docker): Python 3.11 + Postgres 16 (with pgvector)
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r apps/server/requirements.txt
 
-# Ensure DATABASE_URL points to your local Postgres in .env
 export FLASK_APP=app:create_app
 cd apps/server
 gunicorn -b 127.0.0.1:8000 app:create_app()
 ```
 
-## Production Notes
-- Use strong `SECRET_KEY` and managed secrets
-- Put a reverse proxy (e.g., Nginx) in front of Gunicorn
-- Configure logging, metrics, and health endpoints for your orchestrator
-- Consider migrations (Alembic) as schema evolves
-- Enforce authn/z; this sample seeds/uses a default user for simplicity
+---
 
-## License
-Proprietary or internal use by default. Add a specific license here if needed.
+## ✅ Production Notes
+- Strong `SECRET_KEY` and managed secrets
+- Reverse proxy (e.g., Nginx) in front of Gunicorn
+- Logging/metrics/health for your orchestrator
+- Schema migrations with Alembic as you evolve
+- Add real authn/z (defaults use a single dev user)
+
+<div align="center">
+  <br />
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=12,15,19,22,27&height=120&section=footer" alt="footer" />
+</div>
