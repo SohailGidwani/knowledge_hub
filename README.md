@@ -49,6 +49,18 @@ curl http://localhost:8000/api/ping
 
 Data lives under `./data/postgres`, and uploads under `./storage`. Tweak `compose.yaml` to your needs.
 
+Optional: enable local LLM with Ollama
+
+```bash
+# Start Ollama on your host machine
+ollama serve
+
+# Pull the model used by the Answer API
+ollama pull llama3.2:latest
+```
+
+When running the API in Docker, the container reaches your host’s Ollama via `http://host.docker.internal:11434` (preconfigured in `.env` and `compose.yaml`). If you run the API locally (no Docker), use `http://localhost:11434` instead.
+
 ---
 
 ## 🔌 API
@@ -58,6 +70,16 @@ Base: `http://localhost:8000/api`
 - `GET /documents` — list latest 50 documents
 - `POST /documents` — create by title (JSON)
 - `POST /documents/upload` — multipart file upload (with optional `title`)
+
+Search
+
+- `POST /search` — full‑text search over chunks (Postgres FTS)
+- `POST /search/semantic` — vector search (pgvector, cosine distance)
+- `POST /search/hybrid` — blended semantic + FTS with OCR‑confidence weighting
+
+Answer (RAG)
+
+- `POST /answer` — runs hybrid retrieval, packs grounded context, calls your local Ollama model, returns an answer with citations
 
 Examples
 
@@ -74,6 +96,27 @@ curl -X POST http://localhost:8000/api/documents \
 curl -X POST http://localhost:8000/api/documents/upload \
   -F "file=@/path/to/file.pdf" \
   -F "title=Project Plan"
+```
+
+Search (hybrid) example
+
+```bash
+curl -s http://localhost:8000/api/search/hybrid \
+  -H 'Content-Type: application/json' \
+  -d '{"q":"stable matching proof","limit":12,"document_id":6}' | jq .
+```
+
+Answer example
+
+```bash
+curl -s http://localhost:8000/api/answer \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "q": "Prove correctness of Gale–Shapley.",
+        "filters": {"document_id": 6},
+        "k": 16,
+        "max_context_tokens": 3000
+      }' | jq .
 ```
 
 ---
@@ -116,6 +159,8 @@ flowchart LR
   <sub>OCR (optional): OpenCV, PyMuPDF, Tesseract, NumPy</sub>
   <br />
   <sub>Embeddings (optional): Sentence-Transformers, NumPy, PyTorch (CPU)</sub>
+  <br />
+  <sub>LLM (optional): Ollama (local), llama3.2:latest</sub>
   <br /><br />
 </div>
 
@@ -147,6 +192,10 @@ Values are pulled from env and `.env` via Pydantic (see `apps/server/app/config.
 - `SECRET_KEY` — Flask secret for signing
 - `STORAGE_DIR` — upload directory (default `/app/storage`)
 - `MAX_CONTENT_LENGTH` — upload size cap (1 GiB default)
+ - `EMBEDDINGS_BATCH_SIZE` — batch size for embedding jobs (default 128)
+ - `OLLAMA_HOST` — Ollama base URL. In Docker: `http://host.docker.internal:11434`; local: `http://localhost:11434`
+ - `LLM_MODEL` — model to use (default `llama3.2:latest`)
+ - `LLM_TIMEOUT_MS` — LLM request timeout (default 120000)
 
 ---
 
@@ -182,6 +231,7 @@ Note: OCR increases image size; keep it separate if you don’t need it in prod.
 - Confidence-aware ranking: hybrid search slightly down-weights low `ocr_conf` chunks and annotates low confidence in results.
 - Smarter chunking: 300–700 token chunks with small overlaps; preserves detected headings in chunk metadata.
 - Embeddings hygiene: new/changed chunks are auto-indexed after ingest; IVFFlat index present; runs `ANALYZE` after big ingests. Batch size configurable via `EMBEDDINGS_BATCH_SIZE`.
+ - Answer API: `/api/answer` integrates hybrid retrieval with an Ollama-hosted LLM to produce grounded answers with `[CIT-#]` citations, plus timings and debug metadata.
 
 ---
 
@@ -216,6 +266,27 @@ Notes
 
 ---
 
+## 🤖 LLM Integration (Ollama)
+
+The Answer API calls your local Ollama server.
+
+- Ensure Ollama is running on your host: `ollama serve`
+- Pull the model: `ollama pull llama3.2:latest`
+- Docker connectivity: the API container reaches Ollama via `http://host.docker.internal:11434` (set in `.env` and `compose.yaml`).
+
+Troubleshooting
+
+- Error: `httpx.ConnectError: [Errno 111] Connection refused`
+  - Verify Ollama is running and listening on port 11434 on the host.
+  - From the API container: `docker exec -it kh_api curl -s http://host.docker.internal:11434/api/tags`
+  - If running API locally (no Docker), set `OLLAMA_HOST=http://localhost:11434`.
+
+Notes
+
+- Current implementation uses non-streaming chat for simplicity; streaming can be enabled later.
+- If the model returns no citations, the server re-prompts once with stricter instructions to include `[CIT-#]`.
+
+
 ## 🛠 Development
 Local (without Docker): Python 3.11 + Postgres 16 (with pgvector)
 
@@ -228,6 +299,8 @@ export FLASK_APP=app:create_app
 cd apps/server
 gunicorn -b 127.0.0.1:8000 app:create_app()
 ```
+
+If you also want the Answer API locally (no Docker), export `OLLAMA_HOST=http://localhost:11434` and start `ollama serve`.
 
 ---
 
@@ -245,36 +318,3 @@ gunicorn -b 127.0.0.1:8000 app:create_app()
 
 ---
 
-## 🖥 Frontend (Next.js)
-Path: `apps/web`
-
-- App Router with React Query
-- Tailwind styles; simple components (can swap to shadcn/ui later)
-
-Configure API base URL:
-
-```bash
-cd apps/web
-cp .env.local.example .env.local  # optionally
-```
-
-`.env.local`:
-
-```ini
-NEXT_PUBLIC_API_BASE=http://localhost:8000/api
-```
-
-Install and run:
-
-```bash
-cd apps/web
-npm install
-npm run dev
-# open http://localhost:3000
-```
-
-Routes
-- `/` — Search (Keyword | Semantic | Hybrid)
-- `/documents` — Library (list + delete)
-- `/documents/[id]` — Document viewer (basic; page jump via `?page=`)
-- `/upload` — Upload file

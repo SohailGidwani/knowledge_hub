@@ -17,6 +17,9 @@ from pathlib import Path
 
 import filetype
 from flask import request, jsonify, current_app
+from typing import Optional
+import time
+import re
 from werkzeug.utils import secure_filename
 from sqlalchemy import text as sa_text
 
@@ -26,6 +29,7 @@ from ..models import Document, User
 from ..ingestion import process_document
 from ..jobs import index_embeddings
 from ..embeddings import embed_texts
+from ..llm import LLMConfig, ollama_chat, extract_citation_indices
 from ..models import Chunk, Embedding
 
 # ---- helpers ----
@@ -72,6 +76,147 @@ def detect_mime(fp: Path, fallback_name: str) -> str:
 def _to_vector_literal(vec) -> str:
     """Format a numpy (or list) vector as a pgvector literal: '[0.1,-0.2,...]'"""
     return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
+
+
+def _rough_tokens_local(s: str) -> int:
+    # fast proxy for tokens; mirrors ingestion._rough_tokens
+    return max(0, len(re.findall(r"\w+|\S", s or "")))
+
+
+def _trim_preserve_sentence(text: str, max_chars: int = 800) -> str:
+    t = (text or "").strip()
+    if len(t) <= max_chars:
+        return t
+    cut = t[:max_chars]
+    # try to cut on a sentence boundary
+    m = re.search(r"[\.!?]\s+[^\.!?]*$", cut)
+    if m:
+        end = m.start() + 1
+        return cut[:end].strip()
+    # fallback to last whitespace
+    ws = cut.rfind(" ")
+    return cut[: ws if ws > 0 else max_chars].strip()
+
+
+def _hybrid_retrieve_for_answer(q: str, limit: int, doc_id: Optional[int]):
+    # This mirrors search_hybrid() but returns python dicts for reuse here.
+    # --- Semantic side ---
+    qvec = embed_texts([q])[0]
+    qvec_lit = _to_vector_literal(qvec)
+
+    where_doc_sem = "AND c.document_id = :doc_id" if doc_id else ""
+    sem_sql = f"""
+        SELECT
+            c.id   AS chunk_id,
+            c.document_id,
+            d.title AS document_title,
+            c.page_no,
+            c.chunk_index,
+            (e.vector <=> CAST(:qvec AS vector)) AS vdist,
+            LEFT(COALESCE(c.text,''), 400) AS preview,
+            COALESCE((c.extra_json->>'ocr_conf')::float, 100.0) AS ocr_conf
+        FROM embeddings e
+        JOIN chunks c   ON c.id = e.chunk_id
+        JOIN documents d ON d.id = c.document_id
+        WHERE 1=1
+        {where_doc_sem}
+        ORDER BY e.vector <=> CAST(:qvec AS vector) ASC
+        LIMIT :k
+    """
+    k = max(limit * 3, 60)
+    params_sem = {"qvec": qvec_lit, "k": k}
+    if doc_id:
+        params_sem["doc_id"] = int(doc_id)
+    sem_rows = db.session.execute(sa_text(sem_sql), params_sem).mappings().all()
+
+    # --- FTS side ---
+    where_doc_fts = "AND c.document_id = :doc_id" if doc_id else ""
+    fts_sql = f"""
+        WITH qts AS (SELECT websearch_to_tsquery('english', :q) AS tsq)
+        SELECT
+            c.id   AS chunk_id,
+            c.document_id,
+            d.title AS document_title,
+            c.page_no,
+            c.chunk_index,
+            ts_rank_cd(to_tsvector('english', COALESCE(c.text,'')), qts.tsq) AS frank,
+            ts_headline('english', COALESCE(c.text,''), qts.tsq,
+                'StartSel=<b>,StopSel=</b>,MaxFragments=2,MinWords=5,MaxWords=25') AS snippet,
+            COALESCE((c.extra_json->>'ocr_conf')::float, 100.0) AS ocr_conf
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id, qts
+        WHERE to_tsvector('english', COALESCE(c.text,'')) @@ qts.tsq
+        {where_doc_fts}
+        ORDER BY frank DESC
+        LIMIT :k
+    """
+    params_fts = {"q": q, "k": k}
+    if doc_id:
+        params_fts["doc_id"] = int(doc_id)
+    fts_rows = db.session.execute(sa_text(fts_sql), params_fts).mappings().all()
+
+    # --- Blend
+    from math import isfinite
+    def zstats(values):
+        vals = [v for v in values if isfinite(v)]
+        if not vals:
+            return (0.0, 1.0)
+        mu = sum(vals) / len(vals)
+        var = sum((x - mu) ** 2 for x in vals) / max(1, len(vals) - 1)
+        sd = (var ** 0.5) or 1.0
+        return (mu, sd)
+
+    sem = {r["chunk_id"]: r for r in sem_rows}
+    fts = {r["chunk_id"]: r for r in fts_rows}
+    v_sims = [1.0 - float(r["vdist"]) for r in sem_rows]
+    f_scores = [float(r["frank"]) for r in fts_rows]
+    v_mu, v_sd = zstats(v_sims)
+    f_mu, f_sd = zstats(f_scores)
+    alpha, beta = 0.6, 0.4
+    combined = {}
+    for cid, r in sem.items():
+        vsim = 1.0 - float(r["vdist"])
+        vnorm = (vsim - v_mu) / (v_sd or 1.0)
+        combined[cid] = {
+            "chunk_id": cid,
+            "document_id": r["document_id"],
+            "document_title": r["document_title"],
+            "page_no": r["page_no"],
+            "chunk_index": r["chunk_index"],
+            "preview": r["preview"],
+            "snippet": None,
+            "vscore": vnorm,
+            "fscore": 0.0,
+            "ocr_conf": float(r["ocr_conf"]) if r["ocr_conf"] is not None else 100.0,
+        }
+    for cid, r in fts.items():
+        fnorm = (float(r["frank"]) - f_mu) / (f_sd or 1.0)
+        if cid in combined:
+            combined[cid]["fscore"] = fnorm
+            combined[cid]["snippet"] = r["snippet"]
+        else:
+            combined[cid] = {
+                "chunk_id": cid,
+                "document_id": r["document_id"],
+                "document_title": r["document_title"],
+                "page_no": r["page_no"],
+                "chunk_index": r["chunk_index"],
+                "preview": None,
+                "snippet": r["snippet"],
+                "vscore": 0.0,
+                "fscore": fnorm,
+                "ocr_conf": float(r["ocr_conf"]) if r["ocr_conf"] is not None else 100.0,
+            }
+    items = list(combined.values())
+    for it in items:
+        base = alpha * it.get("vscore", 0.0) + beta * it.get("fscore", 0.0)
+        conf = float(it.get("ocr_conf") or 100.0)
+        mult = 0.85 + 0.15 * max(0.0, min(conf, 100.0)) / 100.0
+        it["score"] = base * mult
+        it["low_confidence"] = conf < 60.0
+    items.sort(key=lambda x: x["score"], reverse=True)
+    return items[:limit]
+
 
 # ---- routes ----
 @api_bp.get("/ping")
@@ -587,4 +732,169 @@ def search_hybrid():
                 "low_confidence": r.get("low_confidence", False),
             } for r in items
         ],
+    })
+
+
+@api_bp.post("/answer")
+def answer_api():
+    payload = request.get_json(force=True) if request.is_json else {}
+    q = (payload.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "q is required"}), 400
+
+    filters = payload.get("filters") or {}
+    doc_id = filters.get("document_id") if isinstance(filters, dict) else None
+    k = int(payload.get("k", 16))
+    max_ctx_tokens = int(payload.get("max_context_tokens", 3000))
+
+    t0 = time.monotonic()
+    # Retrieve top chunks (hybrid)
+    top_items = _hybrid_retrieve_for_answer(q, k, doc_id)
+    if not top_items:
+        total_ms = int((time.monotonic() - t0) * 1000)
+        return jsonify({
+            "answer": "Insufficient context; try different keywords or remove filters.",
+            "citations": [],
+            "used_chunks": [],
+            "timings": {"retrieve_ms": total_ms, "llm_ms": 0, "total_ms": total_ms},
+        })
+
+    # Fetch full chunk texts for selected chunks
+    ids = [it["chunk_id"] for it in top_items]
+    q_rows = (
+        db.session.query(
+            Chunk.id.label("chunk_id"),
+            Chunk.text,
+            Chunk.page_no,
+            Chunk.chunk_index,
+            Chunk.document_id,
+            Document.title.label("document_title"),
+        )
+        .join(Document, Document.id == Chunk.document_id)
+        .filter(Chunk.id.in_(ids))
+        .all()
+    )
+    by_id = {}
+    for row in q_rows:
+        by_id[row.chunk_id] = {
+            "chunk_id": row.chunk_id,
+            "text": row.text,
+            "page_no": row.page_no,
+            "chunk_index": row.chunk_index,
+            "document_id": row.document_id,
+            "document_title": row.document_title,
+        }
+
+    # Deduplicate by (document_id, page_no), keep highest score
+    seen_pages = set()
+    packed = []
+    tokens_acc = 0
+    used_chunk_ids = []
+    cit_map = []  # index -> provenance
+    for it in top_items:
+        r = by_id.get(it["chunk_id"])
+        if not r:
+            continue
+        key = (r["document_id"], r["page_no"]) if r["page_no"] is not None else (r["document_id"], -1)
+        if key in seen_pages:
+            continue
+        seen_pages.add(key)
+        text = _trim_preserve_sentence(r.get("text") or "", 800)
+        if not text:
+            continue
+        ctoks = _rough_tokens_local(text)
+        if tokens_acc + ctoks > max_ctx_tokens:
+            break
+        tokens_acc += ctoks
+        used_chunk_ids.append(r["chunk_id"])
+        cit_map.append({
+            "chunk_id": r["chunk_id"],
+            "document_id": r["document_id"],
+            "page_no": r["page_no"],
+            "title": r["document_title"],
+        })
+        packed.append({
+            "title": r["document_title"],
+            "page_no": r["page_no"],
+            "chunk_index": r["chunk_index"],
+            "text": text,
+        })
+
+    retrieve_ms = int((time.monotonic() - t0) * 1000)
+
+    # Build prompt
+    system_msg = (
+        "You answer only from the provided CONTEXT. If insufficient, say so. "
+        "Include [CIT-#] after each claim. Be concise but complete. Do not use prior knowledge."
+    )
+    context_lines = ["CONTEXT:"]
+    for i, blk in enumerate(packed, start=1):
+        head = f"[CIT-{i}] Title: \"{blk['title']}\""
+        if blk.get("page_no"):
+            head += f", Page {blk['page_no']}"
+        context_lines.append(head)
+        context_lines.append(blk["text"])
+        context_lines.append("")
+    context_block = "\n".join(context_lines).strip()
+
+    scope_hint = f" (scope: document_id={doc_id})" if doc_id else ""
+    user_msg = (
+        "Return a coherent answer with bullet points and short paragraphs. "
+        "Don't invent facts. Always cite.\n\n" + context_block + f"\n\nQUESTION{scope_hint}: {q}"
+    )
+
+    # LLM call
+    cfg = LLMConfig(
+        host=str(current_app.config.get("OLLAMA_HOST")),
+        model=str(current_app.config.get("LLM_MODEL")),
+        timeout_ms=int(current_app.config.get("LLM_TIMEOUT_MS", 120000)),
+        num_ctx=None,
+    )
+    try:
+        answer_text, meta = ollama_chat(system_msg, user_msg, cfg, retries=2)
+    except Exception as e:
+        total_ms = int((time.monotonic() - t0) * 1000)
+        return jsonify({
+            "error": "llm_unreachable",
+            "detail": str(e),
+            "hint": "Ensure Ollama is running and OLLAMA_HOST is reachable from the container.",
+            "timings": {"retrieve_ms": retrieve_ms, "llm_ms": 0, "total_ms": total_ms},
+        }), 502
+
+    # If no citations, try one stricter retry
+    cit_idxs = extract_citation_indices(answer_text)
+    if not cit_idxs:
+        stricter = user_msg + "\n\nStrictly include citations like [CIT-#] from CONTEXT only."
+        try:
+            answer_text, meta = ollama_chat(system_msg, stricter, cfg, retries=1)
+        except Exception as e:
+            total_ms = int((time.monotonic() - t0) * 1000)
+            return jsonify({
+                "error": "llm_unreachable",
+                "detail": str(e),
+                "hint": "Ensure Ollama is running and OLLAMA_HOST is reachable from the container.",
+                "timings": {"retrieve_ms": retrieve_ms, "llm_ms": 0, "total_ms": total_ms},
+            }), 502
+        cit_idxs = extract_citation_indices(answer_text)
+
+    # Map citations
+    citations = []
+    for idx in cit_idxs:
+        if 1 <= idx <= len(cit_map):
+            p = cit_map[idx - 1]
+            citations.append({
+                "cit": f"CIT-{idx}",
+                "document_id": p["document_id"],
+                "page_no": p["page_no"],
+                "title": p["title"],
+            })
+
+    total_ms = int((time.monotonic() - t0) * 1000)
+    timings = {"retrieve_ms": retrieve_ms, "llm_ms": meta.get("llm_ms", 0), "total_ms": total_ms}
+
+    return jsonify({
+        "answer": answer_text,
+        "citations": citations,
+        "used_chunks": used_chunk_ids,
+        "timings": timings,
     })

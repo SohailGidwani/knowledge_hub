@@ -37,6 +37,10 @@ def create_app():
         STORAGE_DIR=Path(settings.storage_dir),          # base dir for uploaded files
         MAX_CONTENT_LENGTH=1024 * 1024 * 1024,           # 1GB cap; adjust as needed
         EMBEDDINGS_BATCH_SIZE=int(getattr(settings, "embeddings_batch_size", 128)),
+        # LLM / Ollama
+        OLLAMA_HOST=str(getattr(settings, "ollama_host", "http://localhost:11434")),
+        LLM_MODEL=str(getattr(settings, "llm_model", "llama3.2:latest")),
+        LLM_TIMEOUT_MS=int(getattr(settings, "llm_timeout_ms", 120000)),
     )
 
     db.init_app(app)

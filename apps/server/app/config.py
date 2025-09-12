@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     storage_dir: Path = Path("/app/storage")
     # Embedding job batch size (controls memory usage)
     embeddings_batch_size: int = 128
+    # LLM / Ollama configuration
+    ollama_host: str = "http://localhost:11434"
+    llm_model: str = "llama3.2:latest"
+    llm_timeout_ms: int = 120000
 
     class Config:
         """Pydantic config: load variables from a ``.env`` file if present."""
