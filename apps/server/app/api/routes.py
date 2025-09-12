@@ -18,11 +18,15 @@ from pathlib import Path
 import filetype
 from flask import request, jsonify, current_app
 from werkzeug.utils import secure_filename
+from sqlalchemy import text as sa_text
 
 from . import api_bp
 from ..db import db
 from ..models import Document, User
 from ..ingestion import process_document
+from ..jobs import index_embeddings
+from ..embeddings import embed_texts
+from ..models import Chunk, Embedding
 
 # ---- helpers ----
 def get_default_user():
@@ -64,6 +68,10 @@ def detect_mime(fp: Path, fallback_name: str) -> str:
     import mimetypes
     mime, _ = mimetypes.guess_type(fallback_name)
     return mime or "application/octet-stream"
+
+def _to_vector_literal(vec) -> str:
+    """Format a numpy (or list) vector as a pgvector literal: '[0.1,-0.2,...]'"""
+    return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
 
 # ---- routes ----
 @api_bp.get("/ping")
@@ -179,3 +187,308 @@ def upload_document():
         "status": doc.status,
         "ingest_result": ingest_result,
     }), 201
+
+@api_bp.post("/search")
+def search_chunks():
+    payload = request.get_json(force=True) if request.is_json else {}
+    q = (payload.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "q is required"}), 400
+
+
+    limit = int(payload.get("limit", 20))
+    offset = int(payload.get("offset", 0))
+    doc_id = payload.get("document_id") # optional filter
+
+
+    # Build SQL with optional document filter. We use plainto_tsquery for simplicity;
+    # upgrade to websearch_to_tsquery if you want Google‑like syntax.
+    where_doc = "AND c.document_id = :doc_id" if doc_id else ""
+    sql = f"""
+    WITH q AS (
+    SELECT plainto_tsquery('english', :q) AS tsq
+    )
+    SELECT
+    c.id AS chunk_id,
+    c.document_id,
+    c.page_no,
+    c.chunk_index,
+    d.title AS document_title,
+    ts_rank_cd(to_tsvector('english', coalesce(c.text, '')), q.tsq) AS rank,
+    ts_headline('english', coalesce(c.text, ''), q.tsq,
+    'StartSel=<b>,StopSel=</b>,MaxFragments=2,MinWords=5,MaxWords=25') AS snippet
+    FROM chunks c
+    JOIN documents d ON d.id = c.document_id,
+    q
+    WHERE to_tsvector('english', coalesce(c.text, '')) @@ q.tsq
+    {where_doc}
+    ORDER BY rank DESC, c.id DESC
+    LIMIT :limit OFFSET :offset
+    """
+    params = {"q": q, "limit": limit, "offset": offset}
+    if doc_id:
+        params["doc_id"] = int(doc_id)
+
+
+    rows = db.session.execute(sa_text(sql), params).mappings().all()
+
+
+    return jsonify({
+    "q": q,
+    "count": len(rows),
+    "results": [
+    {
+    "chunk_id": r["chunk_id"],
+    "document_id": r["document_id"],
+    "document_title": r["document_title"],
+    "page_no": r["page_no"],
+    "chunk_index": r["chunk_index"],
+    "rank": float(r["rank"]),
+    "snippet": r["snippet"], # contains <b>...</b>
+    }
+    for r in rows
+    ],
+    "limit": limit,
+    "offset": offset,
+    })
+
+@api_bp.get("/documents/<int:doc_id>/chunks")
+def get_doc_chunks(doc_id: int):
+    limit = int(request.args.get("limit", 50))
+    rows = db.session.execute(sa_text(
+    """
+    SELECT id AS chunk_id, page_no, chunk_index, left(coalesce(text,''), 300) AS sample
+    FROM chunks
+    WHERE document_id = :doc_id
+    ORDER BY page_no, chunk_index
+    LIMIT :limit
+    """
+    ), {"doc_id": doc_id, "limit": limit}).mappings().all()
+    return jsonify({
+    "document_id": doc_id,
+    "count": len(rows),
+    "chunks": rows,
+    })
+
+@api_bp.post("/embeddings/reindex")
+def reindex_embeddings():
+    """
+    Body (optional):
+      - document_id: int (only reindex this doc)
+      - batch_size: int (default 128)
+    """
+    payload = request.get_json(force=True) if request.is_json else {}
+    document_id = payload.get("document_id")
+    batch_size = int(payload.get("batch_size", 128))
+
+    res = index_embeddings(document_id=document_id, batch_size=batch_size)
+    # Optional: ANALYZE to inform ivfflat
+    db.session.execute(sa_text("ANALYZE embeddings;"))
+    return jsonify({"ok": True, "indexed": res})
+
+@api_bp.post("/search/semantic")
+def search_semantic():
+    payload = request.get_json(force=True) if request.is_json else {}
+    q = (payload.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "q is required"}), 400
+
+    limit = int(payload.get("limit", 20))
+    offset = int(payload.get("offset", 0))
+    doc_id = payload.get("document_id")
+
+    # embed query and format as pgvector literal
+    qvec = embed_texts([q])[0]               # numpy array, normalized
+    qvec_lit = _to_vector_literal(qvec)      # e.g. "[0.123,-0.456,...]"
+
+    where_doc = "WHERE c.document_id = :doc_id" if doc_id else ""
+    sql = f"""
+        SELECT
+            e.id AS embedding_id,
+            c.id AS chunk_id,
+            c.document_id,
+            d.title AS document_title,
+            c.page_no,
+            c.chunk_index,
+            (e.vector <=> CAST(:qvec AS vector)) AS distance,   -- cosine distance
+            LEFT(COALESCE(c.text,''), 400) AS preview
+        FROM embeddings e
+        JOIN chunks c   ON c.id = e.chunk_id
+        JOIN documents d ON d.id = c.document_id
+        {where_doc}
+        ORDER BY e.vector <=> CAST(:qvec AS vector) ASC
+        LIMIT :limit OFFSET :offset
+    """
+
+    params = {"qvec": qvec_lit, "limit": limit, "offset": offset}
+    if doc_id:
+        params["doc_id"] = int(doc_id)
+
+    rows = db.session.execute(sa_text(sql), params).mappings().all()
+
+    # Convert cosine distance (0 = identical) to a similarity-ish score for UI
+    results = []
+    for r in rows:
+        dist = float(r["distance"])
+        sim = 1.0 - dist
+        results.append({
+            "chunk_id": r["chunk_id"],
+            "document_id": r["document_id"],
+            "document_title": r["document_title"],
+            "page_no": r["page_no"],
+            "chunk_index": r["chunk_index"],
+            "similarity": sim,
+            "preview": r["preview"],
+        })
+
+    return jsonify({"q": q, "count": len(results), "results": results})
+
+@api_bp.post("/search/hybrid")
+def search_hybrid():
+    payload = request.get_json(force=True) if request.is_json else {}
+    q = (payload.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "q is required"}), 400
+
+    limit = int(payload.get("limit", 20))
+    doc_id = payload.get("document_id")
+
+    # --- Semantic side ---
+    qvec = embed_texts([q])[0]                  # normalized np.array
+    qvec_lit = _to_vector_literal(qvec)         # '[...]' string literal
+
+    where_doc_sem = "AND c.document_id = :doc_id" if doc_id else ""
+    sem_sql = f"""
+        SELECT
+            c.id   AS chunk_id,
+            c.document_id,
+            d.title AS document_title,
+            c.page_no,
+            c.chunk_index,
+            (e.vector <=> CAST(:qvec AS vector)) AS vdist,      -- cosine distance
+            LEFT(COALESCE(c.text,''), 400) AS preview
+        FROM embeddings e
+        JOIN chunks c   ON c.id = e.chunk_id
+        JOIN documents d ON d.id = c.document_id
+        WHERE 1=1
+        {where_doc_sem}
+        ORDER BY e.vector <=> CAST(:qvec AS vector) ASC
+        LIMIT :k
+    """
+    k = max(limit * 3, 60)  # fetch more from each side, blend later
+    params_sem = {"qvec": qvec_lit, "k": k}
+    if doc_id:
+        params_sem["doc_id"] = int(doc_id)
+    sem_rows = db.session.execute(sa_text(sem_sql), params_sem).mappings().all()
+
+    # --- FTS side ---
+    where_doc_fts = "AND c.document_id = :doc_id" if doc_id else ""
+    fts_sql = f"""
+        WITH qts AS (SELECT websearch_to_tsquery('english', :q) AS tsq)
+        SELECT
+            c.id   AS chunk_id,
+            c.document_id,
+            d.title AS document_title,
+            c.page_no,
+            c.chunk_index,
+            ts_rank_cd(to_tsvector('english', COALESCE(c.text,'')), qts.tsq) AS frank,
+            ts_headline('english', COALESCE(c.text,''), qts.tsq,
+                'StartSel=<b>,StopSel=</b>,MaxFragments=2,MinWords=5,MaxWords=25') AS snippet
+        FROM chunks c
+        JOIN documents d ON d.id = c.document_id, qts
+        WHERE to_tsvector('english', COALESCE(c.text,'')) @@ qts.tsq
+        {where_doc_fts}
+        ORDER BY frank DESC
+        LIMIT :k
+    """
+    params_fts = {"q": q, "k": k}
+    if doc_id:
+        params_fts["doc_id"] = int(doc_id)
+    fts_rows = db.session.execute(sa_text(fts_sql), params_fts).mappings().all()
+
+    # --- Blend scores (z-normalize each stream, then weighted sum) ---
+    from math import isfinite
+
+    def zstats(values):
+        vals = [v for v in values if isfinite(v)]
+        if not vals:
+            return (0.0, 1.0)
+        mu = sum(vals) / len(vals)
+        var = sum((x - mu) ** 2 for x in vals) / max(1, len(vals) - 1)
+        sd = (var ** 0.5) or 1.0
+        return (mu, sd)
+
+    # Prepare dicts keyed by chunk_id
+    sem = {r["chunk_id"]: r for r in sem_rows}
+    fts = {r["chunk_id"]: r for r in fts_rows}
+
+    # Convert distances to similarities for semantic, then z-normalize
+    v_sims = [1.0 - float(r["vdist"]) for r in sem_rows]
+    f_scores = [float(r["frank"]) for r in fts_rows]
+    v_mu, v_sd = zstats(v_sims)
+    f_mu, f_sd = zstats(f_scores)
+
+    # weights for final blend
+    alpha, beta = 0.6, 0.4
+
+    combined = {}
+
+    # seed with semantic
+    for cid, r in sem.items():
+        vsim = 1.0 - float(r["vdist"])
+        vnorm = (vsim - v_mu) / (v_sd or 1.0)
+        combined[cid] = {
+            "chunk_id": cid,
+            "document_id": r["document_id"],
+            "document_title": r["document_title"],
+            "page_no": r["page_no"],
+            "chunk_index": r["chunk_index"],
+            "preview": r["preview"],
+            "snippet": None,
+            "vscore": vnorm,
+            "fscore": 0.0,
+        }
+
+    # merge FTS
+    for cid, r in fts.items():
+        fnorm = (float(r["frank"]) - f_mu) / (f_sd or 1.0)
+        if cid in combined:
+            combined[cid]["fscore"] = fnorm
+            combined[cid]["snippet"] = r["snippet"]
+        else:
+            combined[cid] = {
+                "chunk_id": cid,
+                "document_id": r["document_id"],
+                "document_title": r["document_title"],
+                "page_no": r["page_no"],
+                "chunk_index": r["chunk_index"],
+                "preview": None,
+                "snippet": r["snippet"],
+                "vscore": 0.0,
+                "fscore": fnorm,
+            }
+
+    # final score & sort
+    items = list(combined.values())
+    for it in items:
+        it["score"] = alpha * it["vscore"] + beta * it["fscore"]
+    items.sort(key=lambda x: x["score"], reverse=True)
+    items = items[:limit]
+
+    return jsonify({
+        "q": q,
+        "count": len(items),
+        "weights": {"semantic": alpha, "fts": beta},
+        "results": [
+            {
+                "chunk_id": r["chunk_id"],
+                "document_id": r["document_id"],
+                "document_title": r["document_title"],
+                "page_no": r["page_no"],
+                "chunk_index": r["chunk_index"],
+                "score": r["score"],
+                "snippet": r["snippet"],   # may contain <b>..</b>
+                "preview": r["preview"],   # plain text
+            } for r in items
+        ],
+    })

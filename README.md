@@ -3,7 +3,7 @@
 </div>
 
 <h3 align="center">
-  <em>A minimal, container-ready document API with optional OCR ingestion</em>
+  <em>A minimal, container-ready document API with optional OCR + embeddings</em>
 </h3>
 
 <div align="center">
@@ -18,7 +18,7 @@
 <br />
 
 ## ✨ What Is This?
-Knowledge Hub is a lightweight document management and ingestion service built with Flask, SQLAlchemy, and Postgres+pgvector. It exposes simple endpoints to upload, list, and manage documents — with an optional OCR pipeline to turn PDFs/images into searchable text chunks.
+Knowledge Hub is a lightweight document management and ingestion service built with Flask, SQLAlchemy, and Postgres+pgvector. It exposes simple endpoints to upload, list, and manage documents — with optional OCR to turn PDFs/images into searchable text chunks and an optional embeddings indexer to vectorize content for similarity search.
 
 <div align="center">
   <sub>Quick links</sub><br />
@@ -26,6 +26,7 @@ Knowledge Hub is a lightweight document management and ingestion service built w
   <a href="#-api">API</a> •
   <a href="#-tech-stack">Tech Stack</a> •
   <a href="#-ingestion-ocr-optional">OCR</a> •
+  <a href="#-embeddings-optional">Embeddings</a> •
   <a href="#-development">Dev</a>
 </div>
 
@@ -88,6 +89,7 @@ flowchart LR
     R[Routes /api]
     M[Models and SQLAlchemy]
     I[Ingestion OCR]
+    E[Embeddings Indexer]
   end
 
   DB[Postgres with pgvector]
@@ -99,6 +101,8 @@ flowchart LR
   R --> FS
   R --> I
   I --> M
+  R --> E
+  E --> M
 ```
 
 ---
@@ -110,6 +114,8 @@ flowchart LR
   <sub>Plus: SQLAlchemy, Gunicorn, pgvector, Pydantic Settings</sub>
   <br />
   <sub>OCR (optional): OpenCV, PyMuPDF, Tesseract, NumPy</sub>
+  <br />
+  <sub>Embeddings (optional): Sentence-Transformers, NumPy, PyTorch (CPU)</sub>
   <br /><br />
 </div>
 
@@ -168,6 +174,37 @@ RUN apt-get update && apt-get install -y \
 ```
 
 Note: OCR increases image size; keep it separate if you don’t need it in prod.
+
+---
+
+## 🧭 Embeddings — Optional
+`apps/server/app/embeddings.py` provides helpers to embed text with Sentence-Transformers (default model: `all-MiniLM-L6-v2`). `apps/server/app/jobs.py` includes a batch indexer that finds chunks without embeddings and writes vectors to the `embeddings` table (pgvector column).
+
+Packages to add (not included by default):
+
+```text
+sentence-transformers
+numpy
+# Torch is pulled automatically by sentence-transformers; you can pin a CPU build if needed
+```
+
+Run indexing inside the API container:
+
+```bash
+# After adding packages to apps/server/requirements.txt and rebuilding the image
+docker compose exec kh_api python - <<'PY'
+from app import create_app
+from app.jobs import index_embeddings
+app = create_app()
+with app.app_context():
+    # Index all chunks without embeddings (first run will download the model)
+    print(index_embeddings())
+PY
+```
+
+Notes
+- First run downloads the Sentence-Transformers model into the container cache.
+- You can target a single document: `index_embeddings(document_id=123)`.
 
 ---
 

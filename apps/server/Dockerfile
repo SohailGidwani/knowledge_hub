@@ -19,4 +19,5 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 
-CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:create_app()"]
+# at the bottom, replace CMD with:
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "--timeout", "300", "--graceful-timeout", "120", "--workers", "1", "app:create_app()"]
