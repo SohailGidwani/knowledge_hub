@@ -92,8 +92,8 @@ class Embedding(db.Model):
 
     model = db.Column(db.String(128), nullable=False)
     dim = db.Column(db.Integer, nullable=False)
-    # Vector column for storing embeddings. 'dim' should match the embedding model's dimension.
-    vector = db.Column(Vector(dim=768))
+    # Vector column for storing embeddings. Must match model output dimension (MiniLM: 384).
+    vector = db.Column(Vector(dim=384))
 
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 

@@ -1,121 +1,62 @@
 from __future__ import annotations
-import io
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Iterable, Tuple
+
+import logging
+import re
 
 import cv2
 import fitz  # PyMuPDF
-import pytesseract
-from flask import current_app
-
-from .db import db
-from .models import Document, Chunk
-
-import math
 import numpy as np
-import cv2
-import fitz
 import pytesseract
 from pytesseract import Output
 
-# ---------- image utils ----------
+from .db import db
+from sqlalchemy import text as sa_text
+from .models import Document, Chunk
+from .jobs import index_embeddings
+from flask import current_app
 
-def _deskew(gray: np.ndarray) -> np.ndarray:
-    # Invert for text as white
-    inv = cv2.bitwise_not(gray)
-    coords = np.column_stack(np.where(inv > 0))
-    if coords.size == 0:
-        return gray
-    angle = cv2.minAreaRect(coords)[-1]
-    # cv2 returns [-90, 0); convert to [-45,45]
-    if angle < -45:
-        angle = -(90 + angle)
-    else:
-        angle = -angle
-    (h, w) = gray.shape[:2]
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+log = logging.getLogger(__name__)
 
-def _enhance(gray: np.ndarray) -> np.ndarray:
-    # light denoise + contrast boost
-    den = cv2.fastNlMeansDenoising(gray, h=8)
-    # unsharp mask
-    blur = cv2.GaussianBlur(den, (0, 0), 1.0)
-    sharp = cv2.addWeighted(den, 1.5, blur, -0.5, 0)
-    return sharp
+# --------- OCR helpers ---------
 
-def _binarize_candidates(gray: np.ndarray) -> list[np.ndarray]:
-    # Multiple thresholding strategies; we’ll OCR each and pick best by confidence
-    thr1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 31, 10)
-    thr2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                 cv2.THRESH_BINARY, 41, 5)
-    _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return [thr1, thr2, thr3]
+_TESS_CONFIGS = [
+    "--oem 1 --psm 6",   # block of text
+    "--oem 1 --psm 4",   # single column
+    "--oem 1 --psm 11",  # sparse text
+]
 
-def _preprocess_for_ocr(image_bgr: np.ndarray) -> list[np.ndarray]:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    gray = _deskew(gray)
-    gray = _enhance(gray)
-    cands = _binarize_candidates(gray)
-    # mild morphology to connect handwriting strokes
-    out = []
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    for img in cands:
-        closed = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel, iterations=1)
-        out.append(closed)
-    return out
 
-def _pixmap_to_cv2(pix):
+def _pixmap_to_cv2(pix) -> np.ndarray:
     buf = np.frombuffer(pix.samples, dtype=np.uint8)
     arr = buf.reshape(pix.height, pix.width, pix.n)
     if pix.n == 3:
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    elif pix.n == 4:
+    if pix.n == 4:
         return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-    else:
-        return arr
+    return arr
 
-# ---------- OCR runners ----------
 
-_TESS_CONFIGS = [
-    # LSTM-only, assume a block of text
-    "--oem 1 --psm 6",
-    # sparse text with OSD
-    "--oem 1 --psm 11",
-    # single column (common for assignments)
-    "--oem 1 --psm 4",
-]
+def _preprocess_variants(image_bgr: np.ndarray) -> list[np.ndarray]:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.fastNlMeansDenoising(gray, h=8)
+    # Try multiple thresholds; pick best by confidence later
+    thr1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10)
+    thr2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 41, 5)
+    _, thr3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return [thr1, thr2, thr3]
 
-def _ocr_with_conf(img: np.ndarray, lang: str = "eng") -> tuple[str, float]:
-    """
-    Returns (text, avg_conf 0..100). Uses image_to_data to compute confidence.
-    """
-    data = pytesseract.image_to_data(img, lang=lang, output_type=Output.DICT, config="--oem 1 --psm 6")
-    texts, confs = data.get("text", []), data.get("conf", [])
-    pieces = []
-    scores = []
-    for t, c in zip(texts, confs):
-        if t and t.strip() and c != '-1':
-            pieces.append(t)
-            try:
-                scores.append(float(c))
-            except Exception:
-                pass
-    text = " ".join(pieces).strip()
-    avg_conf = float(sum(scores) / len(scores)) if scores else 0.0
-    return text, avg_conf
 
-def _try_tesseract_variants(bin_imgs: list[np.ndarray], lang: str = "eng") -> tuple[str, float]:
+def _ocr_best(img_variants: list[np.ndarray], lang: str = "eng") -> tuple[str, float]:
     best_text, best_conf = "", 0.0
-    for img in bin_imgs:
-        # Run a few PSMs and keep the best confidence
+    for img in img_variants:
         for cfg in _TESS_CONFIGS:
             data = pytesseract.image_to_data(img, lang=lang, output_type=Output.DICT, config=cfg)
             texts, confs = data.get("text", []), data.get("conf", [])
             pieces, scores = [], []
             for t, c in zip(texts, confs):
-                if t and t.strip() and c != '-1':
+                if t and t.strip() and c != "-1":
                     pieces.append(t)
                     try:
                         scores.append(float(c))
@@ -123,60 +64,124 @@ def _try_tesseract_variants(bin_imgs: list[np.ndarray], lang: str = "eng") -> tu
                         pass
             text = " ".join(pieces).strip()
             conf = float(sum(scores) / len(scores)) if scores else 0.0
-            if conf > best_conf and len(text) > 0:
-                best_conf, best_text = conf, text
+            if conf > best_conf and text:
+                best_text, best_conf = text, conf
     return best_text, best_conf
 
-def _preprocess_for_ocr(image_bgr):
-    # convert to gray
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    # de-noise lightly
-    gray = cv2.fastNlMeansDenoising(gray, h=10)
-    # adaptive threshold to help handwriting
-    thr = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
-    )
-    return thr
+
+# --------- Text-first PDF extraction ---------
+
+def _page_has_text(page: fitz.Page) -> bool:
+    txt = (page.get_text("text") or "").strip()
+    # Consider presence of letters as a signal; ignore pure numbers/whitespace
+    return bool(txt) and bool(re.search(r"[A-Za-z]", txt))
 
 
-def _pixmap_to_cv2(pix):
-    # pix.samples is bytes in RGB
-    img = memoryview(pix.samples)
-    arr = np.frombuffer(img, dtype=np.uint8)
-    arr = arr.reshape(pix.height, pix.width, pix.n)
-    # convert RGB -> BGR for OpenCV
-    if pix.n == 3:
-        return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    elif pix.n == 4:
-        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-    else:
-        # grayscale
-        return arr
-
-
-# numpy import placed after function defs to keep linters happy
-import numpy as np  # noqa: E402
-
-
-def ocr_pdf_to_chunks(pdf_path: Path, lang: str = "eng"):
-    """Yield (page_no, text) for each page in the PDF via OCR.
-    Uses PyMuPDF to render at 2x for better OCR of handwriting.
+def extract_pdf_pages_textfirst(pdf_path: Path, lang: str = "eng") -> Iterable[Tuple[int, str, float]]:
+    """
+    Yield (page_no, text, ocr_conf) where ocr_conf is None for embedded text pages.
+    Only OCR pages that lack embedded text.
     """
     doc = fitz.open(pdf_path)
     for i, page in enumerate(doc, start=1):
-        # Render bigger for handwriting (3x is a good CPU/quality tradeoff)
+        if _page_has_text(page):
+            text = page.get_text("text") or ""
+            log.info("ingest.page text page=%s chars=%s", i, len(text))
+            yield i, text, None
+            continue
+        # OCR path
         pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
         img_bgr = _pixmap_to_cv2(pix)
-        bin_variants = _preprocess_for_ocr(img_bgr)
-        text, conf = _try_tesseract_variants(bin_variants, lang=lang)
+        variants = _preprocess_variants(img_bgr)
+        text, conf = _ocr_best(variants, lang=lang)
+        log.info("ingest.page ocr page=%s conf=%.1f chars=%s", i, float(conf or 0.0), len(text))
         yield i, text, conf
 
+
+# --------- Chunking (300–700 tokens with overlap, heading-aware) ---------
+
+def _rough_tokens(s: str) -> int:
+    # fast proxy for tokens; keeps us in range
+    return max(0, len(re.findall(r"\w+|\S", s)))
+
+
+def _is_heading(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return False
+    if len(line) > 80:
+        return False
+    if line.endswith(('.', ':', ';')):
+        return False
+    if re.match(r"^(\d+\.|[\-\*•])\s", line):
+        return False
+    # Title Case or ALL CAPS heuristic
+    return (line.isupper() and len(line) >= 3) or (
+        sum(1 for w in line.split() if w[:1].isupper()) >= max(1, len(line.split()) // 2)
+    )
+
+
+def _chunk_page_text(page_no: int, text: str, target_min: int = 300, target_max: int = 700, overlap: int = 50):
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    headings = []  # keep last few headings
+    paras: list[str] = []
+    buf: list[str] = []
+
+    for ln in lines + [""]:
+        if _is_heading(ln):
+            headings.append(ln.strip())
+        if ln.strip():
+            buf.append(ln)
+        else:
+            if buf:
+                paras.append("\n".join(buf).strip())
+                buf = []
+
+    # Greedy pack paragraphs into chunks with overlap
+    chunks = []
+    cur: list[str] = []
+    cur_tokens = 0
+    i = 0
+    for p in paras:
+        ptoks = _rough_tokens(p)
+        if cur_tokens + ptoks <= target_max:
+            cur.append(p)
+            cur_tokens += ptoks
+            continue
+        # flush if we have enough
+        if cur_tokens >= target_min or not cur:
+            chunks.append("\n\n".join(cur).strip())
+            # start next with overlap from tail
+            if overlap > 0 and chunks[-1]:
+                tail = chunks[-1].split()
+                tail = tail[-overlap:]
+                cur = [" ".join(tail), p]
+                cur_tokens = _rough_tokens(cur[0]) + ptoks
+            else:
+                cur = [p]
+                cur_tokens = ptoks
+        else:
+            # not enough yet; just add
+            cur.append(p)
+            cur_tokens += ptoks
+        i += 1
+    if cur:
+        chunks.append("\n\n".join(cur).strip())
+
+    # Compose heading path (last 2 headings) for context
+    heading_path = " > ".join(headings[-2:]) if headings else None
+
+    for idx, ch in enumerate(chunks):
+        yield idx, ch, heading_path
+
+
 def process_document(document_id: int, lang: Optional[str] = None) -> dict:
-    """Synchronous ingestion for a single document.
-    - If PDF: OCR each page to text chunks
-    - If image: OCR the image as page 1
-    - For other types: no-op for now
-    Returns summary dict with counts.
+    """
+    Synchronous ingestion for a single document.
+    - For PDF: prefer embedded text; OCR only pages lacking text.
+    - For images: OCR as a single-page doc.
+    - Chunk into 300–700 token segments with small overlaps.
+    Returns summary dict with counts and stages.
     """
     lang = lang or "eng"
     d: Document | None = Document.query.get(document_id)
@@ -187,51 +192,76 @@ def process_document(document_id: int, lang: Optional[str] = None) -> dict:
     if not path.exists():
         return {"error": f"missing file: {path}"}
 
-    created = 0
+    total_chunks = 0
     pages = 0
 
     if (d.mime_type or "").startswith("application/pdf"):
-        texts = list(ocr_pdf_to_chunks(path, lang=lang))
-        pages = len(texts)
-        for page_no, text, conf in ocr_pdf_to_chunks(path, lang=lang):
-            chunk = Chunk(
-                document_id=d.id,
-                version=1,
-                page_no=page_no,
-                chunk_index=0,
-                text=text.strip(),
-                modality="text",
-                extra_json={"ocr_conf": conf}  # <-- store confidence here
-            )
-            db.session.add(chunk)
-            created += 1
+        log.info("ingest.start pdf document_id=%s path=%s", d.id, path)
+        for page_no, text, conf in extract_pdf_pages_textfirst(path, lang=lang):
             pages += 1
+            base_conf = conf if conf is not None else 100.0
+            per_page_chunks = 0
+            for idx, ch_text, heading_path in _chunk_page_text(page_no, text):
+                chunk = Chunk(
+                    document_id=d.id,
+                    version=1,
+                    page_no=page_no,
+                    chunk_index=idx,
+                    text=(ch_text or "").strip(),
+                    modality="text",
+                    tokens=_rough_tokens(ch_text or ""),
+                    extra_json={
+                        "ocr_conf": base_conf,
+                        **({"heading_path": heading_path} if heading_path else {}),
+                    },
+                )
+                db.session.add(chunk)
+                total_chunks += 1
+                per_page_chunks += 1
+            log.info("ingest.page_chunks page=%s chunks=%s", page_no, per_page_chunks)
+
         d.pages = pages
         d.status = "ready"
         db.session.commit()
-        return {"pages": pages, "chunks_created": created}
+        log.info("ingest.done pdf document_id=%s pages=%s chunks=%s", d.id, pages, total_chunks)
 
     elif (d.mime_type or "").startswith("image/"):
-        # Treat single image like a one-page doc
+        log.info("ingest.start image document_id=%s path=%s", d.id, path)
         img = cv2.imread(str(path))
         if img is None:
             return {"error": "failed to read image"}
-        proc = _preprocess_for_ocr(img)
-        text = pytesseract.image_to_string(proc, lang=lang)
-        chunk = Chunk(
-            document_id=d.id,
-            version=1,
-            page_no=1,
-            chunk_index=0,
-            text=text.strip(),
-            modality="text",
-        )
-        db.session.add(chunk)
+        text, conf = _ocr_best(_preprocess_variants(img), lang=lang)
+        for idx, ch_text, heading_path in _chunk_page_text(1, text):
+            chunk = Chunk(
+                document_id=d.id,
+                version=1,
+                page_no=1,
+                chunk_index=idx,
+                text=(ch_text or "").strip(),
+                modality="text",
+                tokens=_rough_tokens(ch_text or ""),
+                extra_json={
+                    "ocr_conf": float(conf or 0.0),
+                    **({"heading_path": heading_path} if heading_path else {}),
+                },
+            )
+            db.session.add(chunk)
+            total_chunks += 1
         d.pages = 1
         d.status = "ready"
         db.session.commit()
-        return {"pages": 1, "chunks_created": 1}
+        log.info("ingest.done image document_id=%s pages=1 chunks=%s", d.id, total_chunks)
 
     else:
-        # Future: add text/pdfminer path and other formats
         return {"skipped": True, "reason": f"unsupported mime: {d.mime_type}"}
+
+    # Auto-index embeddings for new chunks
+    try:
+        batch_size = int(current_app.config.get("EMBEDDINGS_BATCH_SIZE", 128))
+    except Exception:
+        batch_size = 128
+    idx_res = index_embeddings(document_id=d.id, batch_size=batch_size)
+    # Hints for planner/ivfflat after large ingests
+    db.session.execute(sa_text("ANALYZE embeddings;"))
+    db.session.execute(sa_text("ANALYZE chunks;"))
+    return {"pages": pages, "chunks_created": total_chunks, "indexed": idx_res}

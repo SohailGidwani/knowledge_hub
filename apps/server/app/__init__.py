@@ -6,6 +6,7 @@ local development.
 """
 
 from flask import Flask, jsonify
+from flask_cors import CORS
 from sqlalchemy import text
 from pathlib import Path
 
@@ -25,6 +26,8 @@ def create_app():
     - Registers the API blueprint under ``/api``.
     """
     app = Flask(__name__)
+    # Allow the Next.js dev server to call the API during development
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     settings = Settings()
     app.config.update(
@@ -33,6 +36,7 @@ def create_app():
         SECRET_KEY=settings.secret_key,                  # Flask session/signing secret
         STORAGE_DIR=Path(settings.storage_dir),          # base dir for uploaded files
         MAX_CONTENT_LENGTH=1024 * 1024 * 1024,           # 1GB cap; adjust as needed
+        EMBEDDINGS_BATCH_SIZE=int(getattr(settings, "embeddings_batch_size", 128)),
     )
 
     db.init_app(app)
@@ -50,6 +54,14 @@ def create_app():
 
         # 3) Create indexes (safe if run multiple times)
         with db.engine.connect() as conn:
+            # Ensure embeddings.vector has correct dimension (384) matching MiniLM
+            # Safe to attempt; ignore if already correct or table doesn't exist yet
+            try:
+                conn.execute(text("ALTER TABLE embeddings ALTER COLUMN vector TYPE vector(384)"))
+                conn.commit()
+            except Exception:
+                pass
+
             # FTS GIN index on chunks.text
             conn.execute(text(
                 """

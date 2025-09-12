@@ -177,6 +177,14 @@ Note: OCR increases image size; keep it separate if you don’t need it in prod.
 
 ---
 
+## ♻️ Recent Upgrades
+- Text-first PDF extraction: extracts embedded text and OCRs only pages that lack it (faster, cleaner for books).
+- Confidence-aware ranking: hybrid search slightly down-weights low `ocr_conf` chunks and annotates low confidence in results.
+- Smarter chunking: 300–700 token chunks with small overlaps; preserves detected headings in chunk metadata.
+- Embeddings hygiene: new/changed chunks are auto-indexed after ingest; IVFFlat index present; runs `ANALYZE` after big ingests. Batch size configurable via `EMBEDDINGS_BATCH_SIZE`.
+
+---
+
 ## 🧭 Embeddings — Optional
 `apps/server/app/embeddings.py` provides helpers to embed text with Sentence-Transformers (default model: `all-MiniLM-L6-v2`). `apps/server/app/jobs.py` includes a batch indexer that finds chunks without embeddings and writes vectors to the `embeddings` table (pgvector column).
 
@@ -234,3 +242,39 @@ gunicorn -b 127.0.0.1:8000 app:create_app()
   <br />
   <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=12,15,19,22,27&height=120&section=footer" alt="footer" />
 </div>
+
+---
+
+## 🖥 Frontend (Next.js)
+Path: `apps/web`
+
+- App Router with React Query
+- Tailwind styles; simple components (can swap to shadcn/ui later)
+
+Configure API base URL:
+
+```bash
+cd apps/web
+cp .env.local.example .env.local  # optionally
+```
+
+`.env.local`:
+
+```ini
+NEXT_PUBLIC_API_BASE=http://localhost:8000/api
+```
+
+Install and run:
+
+```bash
+cd apps/web
+npm install
+npm run dev
+# open http://localhost:3000
+```
+
+Routes
+- `/` — Search (Keyword | Semantic | Hybrid)
+- `/documents` — Library (list + delete)
+- `/documents/[id]` — Document viewer (basic; page jump via `?page=`)
+- `/upload` — Upload file

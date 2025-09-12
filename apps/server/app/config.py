@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg2://khub:khubpassword@localhost:5432/knowledgehub"
     secret_key: str = "devsecret"
     storage_dir: Path = Path("/app/storage")
+    # Embedding job batch size (controls memory usage)
+    embeddings_batch_size: int = 128
 
     class Config:
         """Pydantic config: load variables from a ``.env`` file if present."""

@@ -4,9 +4,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import load_only
 import numpy as np
 
+import logging
 from .db import db
 from .models import Chunk, Embedding
 from .embeddings import embed_texts
+
+log = logging.getLogger(__name__)
 
 def iter_chunk_ids_texts(document_id: Optional[int] = None, batch_size: int = 128) -> Iterable[list[tuple[int, str]]]:
     q = db.session.query(Chunk.id, Chunk.text)
@@ -36,6 +39,7 @@ def index_embeddings(document_id: Optional[int] = None, batch_size: int = 128, m
         texts = [t for _, t in batch]
         if not ids:
             continue
+        log.info("embed.batch start size=%s", len(ids))
         vecs = embed_texts(texts)  # np.ndarray [B, D], normalized
 
         rows = []
@@ -53,4 +57,7 @@ def index_embeddings(document_id: Optional[int] = None, batch_size: int = 128, m
         total_chunks += len(batch)
         total_vectors += len(rows)
 
+        log.info("embed.batch committed rows=%s", len(rows))
+
+    log.info("embed.done chunks=%s vectors=%s", total_chunks, total_vectors)
     return {"chunks_indexed": total_chunks, "vectors_created": total_vectors}

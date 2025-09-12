@@ -97,6 +97,25 @@ def list_documents():
         for d in docs
     ])
 
+@api_bp.get("/documents/<int:doc_id>")
+def get_document(doc_id: int):
+    """Return a single document record by id."""
+    d = Document.query.get(doc_id)
+    if not d:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({
+        "id": d.id,
+        "title": d.title,
+        "status": d.status,
+        "mime_type": d.mime_type,
+        "source_path": (d.source_path or "").replace("/app/", "/"),
+        "pages": d.pages,
+        "bytes": d.bytes,
+        "hash_sha256": d.hash_sha256,
+        "created_at": d.created_at.isoformat(),
+        "updated_at": d.updated_at.isoformat(),
+    })
+
 @api_bp.post("/documents")
 def create_document():
     """Create a simple Document by title (no file upload).
@@ -187,6 +206,73 @@ def upload_document():
         "status": doc.status,
         "ingest_result": ingest_result,
     }), 201
+
+@api_bp.delete("/documents/<int:doc_id>")
+def delete_document(doc_id: int):
+    """Delete a document and all related data (chunks, embeddings, tags),
+    and optionally remove the stored source file.
+
+    Query params:
+      - delete_file=true|false (default true)
+    """
+    d = Document.query.get(doc_id)
+    if not d:
+        return jsonify({"error": "document not found"}), 404
+
+    delete_file = (request.args.get("delete_file", "true").lower() != "false")
+    file_deleted = False
+
+    # Remove file on disk if it's under STORAGE_DIR for safety
+    if delete_file and d.source_path:
+        try:
+            storage_dir: Path = current_app.config["STORAGE_DIR"].resolve()
+            fp = Path(d.source_path).resolve()
+            # Only delete if the file resides inside storage_dir
+            if str(fp).startswith(str(storage_dir)) and fp.exists():
+                fp.unlink()
+                file_deleted = True
+        except Exception:
+            # Swallow file errors but continue DB cleanup
+            pass
+
+    # Delete in dependency order with explicit SQL for robustness
+    # 1) embeddings -> via chunks
+    res_emb = db.session.execute(sa_text(
+        """
+        DELETE FROM embeddings e
+        USING chunks c
+        WHERE e.chunk_id = c.id AND c.document_id = :doc_id
+        """
+    ), {"doc_id": doc_id})
+
+    # 2) chunks
+    res_chunks = db.session.execute(sa_text(
+        "DELETE FROM chunks WHERE document_id = :doc_id"
+    ), {"doc_id": doc_id})
+
+    # 3) document_tags (if any)
+    res_tags = db.session.execute(sa_text(
+        "DELETE FROM document_tags WHERE document_id = :doc_id"
+    ), {"doc_id": doc_id})
+
+    # 4) document
+    res_doc = db.session.execute(sa_text(
+        "DELETE FROM documents WHERE id = :doc_id"
+    ), {"doc_id": doc_id})
+
+    db.session.commit()
+
+    return jsonify({
+        "ok": True,
+        "document_id": doc_id,
+        "deleted": {
+            "embeddings": res_emb.rowcount if hasattr(res_emb, "rowcount") else None,
+            "chunks": res_chunks.rowcount if hasattr(res_chunks, "rowcount") else None,
+            "tags": res_tags.rowcount if hasattr(res_tags, "rowcount") else None,
+            "documents": res_doc.rowcount if hasattr(res_doc, "rowcount") else None,
+        },
+        "file_deleted": file_deleted,
+    })
 
 @api_bp.post("/search")
 def search_chunks():
@@ -366,7 +452,8 @@ def search_hybrid():
             c.page_no,
             c.chunk_index,
             (e.vector <=> CAST(:qvec AS vector)) AS vdist,      -- cosine distance
-            LEFT(COALESCE(c.text,''), 400) AS preview
+            LEFT(COALESCE(c.text,''), 400) AS preview,
+            COALESCE((c.extra_json->>'ocr_conf')::float, 100.0) AS ocr_conf
         FROM embeddings e
         JOIN chunks c   ON c.id = e.chunk_id
         JOIN documents d ON d.id = c.document_id
@@ -393,7 +480,8 @@ def search_hybrid():
             c.chunk_index,
             ts_rank_cd(to_tsvector('english', COALESCE(c.text,'')), qts.tsq) AS frank,
             ts_headline('english', COALESCE(c.text,''), qts.tsq,
-                'StartSel=<b>,StopSel=</b>,MaxFragments=2,MinWords=5,MaxWords=25') AS snippet
+                'StartSel=<b>,StopSel=</b>,MaxFragments=2,MinWords=5,MaxWords=25') AS snippet,
+            COALESCE((c.extra_json->>'ocr_conf')::float, 100.0) AS ocr_conf
         FROM chunks c
         JOIN documents d ON d.id = c.document_id, qts
         WHERE to_tsvector('english', COALESCE(c.text,'')) @@ qts.tsq
@@ -447,6 +535,7 @@ def search_hybrid():
             "snippet": None,
             "vscore": vnorm,
             "fscore": 0.0,
+            "ocr_conf": float(r["ocr_conf"]) if r["ocr_conf"] is not None else 100.0,
         }
 
     # merge FTS
@@ -466,12 +555,18 @@ def search_hybrid():
                 "snippet": r["snippet"],
                 "vscore": 0.0,
                 "fscore": fnorm,
+                "ocr_conf": float(r["ocr_conf"]) if r["ocr_conf"] is not None else 100.0,
             }
 
     # final score & sort
     items = list(combined.values())
     for it in items:
-        it["score"] = alpha * it["vscore"] + beta * it["fscore"]
+        base = alpha * it.get("vscore", 0.0) + beta * it.get("fscore", 0.0)
+        conf = float(it.get("ocr_conf") or 100.0)
+        # Slight down-weighting for low OCR confidence: 0.85 .. 1.0 multiplier
+        mult = 0.85 + 0.15 * max(0.0, min(conf, 100.0)) / 100.0
+        it["score"] = base * mult
+        it["low_confidence"] = conf < 60.0
     items.sort(key=lambda x: x["score"], reverse=True)
     items = items[:limit]
 
@@ -489,6 +584,7 @@ def search_hybrid():
                 "score": r["score"],
                 "snippet": r["snippet"],   # may contain <b>..</b>
                 "preview": r["preview"],   # plain text
+                "low_confidence": r.get("low_confidence", False),
             } for r in items
         ],
     })
