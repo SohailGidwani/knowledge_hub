@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { clsx } from 'clsx';
+import { ThemeToggle } from '@/components/theme-toggle';
 
 const navItems = [
   { href: '/upload' as const, label: 'Upload' },
@@ -28,6 +29,7 @@ export function Nav() {
               {i.label}
             </Link>
           ))}
+          <ThemeToggle />
         </nav>
       </div>
     </header>
