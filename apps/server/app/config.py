@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     embeddings_batch_size: int = 128
     # LLM / Ollama configuration
     ollama_host: str = "http://localhost:11434"
-    llm_model: str = "llama3.2:latest"
+    llm_model: str = "gemma3:1b"
     llm_timeout_ms: int = 120000
 
     class Config:

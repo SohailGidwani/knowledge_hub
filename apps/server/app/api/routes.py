@@ -826,6 +826,8 @@ def answer_api():
     system_msg = (
         "You answer only from the provided CONTEXT. If insufficient, say so. "
         "Include [CIT-#] after each claim. Be concise but complete. Do not use prior knowledge."
+        "You are a helpful assistant that can answer questions about the provided CONTEXT."
+        "Don't say 'based on the context' or 'based on the provided information' everytime you answer a question ."
     )
     context_lines = ["CONTEXT:"]
     for i, blk in enumerate(packed, start=1):
